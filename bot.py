@@ -19,6 +19,8 @@ REMINDER_MIN   = int(os.environ.get("REMINDER_MINUTE", "0"))
 
 # ── Шаги диалога ─────────────────────────────────────────────────────────────
 DATE, ADDRESS, WORK, COLLECTED, SHARE, CONFIRM = range(6)
+# Дополнение записи
+EDIT_NUM, EDIT_ADDR, EDIT_WORK, EDIT_COLLECTED, EDIT_SHARE, EDIT_CONFIRM = range(6, 12)
 
 # ── БД ───────────────────────────────────────────────────────────────────────
 
@@ -71,8 +73,53 @@ def upsert_report(user_id, data: dict):
     c.commit()
     c.close()
 
+def append_to_report(user_id, date, extra: dict):
+    """Дополняет существующую запись — добавляет новые значения через запятую."""
+    row = get_report_by_date(user_id, date)
+    if not row:
+        return False
+
+    _, old_addr, old_work, old_tf, old_tt, old_col, old_share = row
+
+    def merge(old, new, is_money=False):
+        """Склеивает старое и новое через запятую, или суммирует деньги."""
+        old = (old or "").strip()
+        new = (new or "").strip()
+        if not new or new in ("Пропустить", "Не брал", "Не менялось"):
+            return old
+        if is_money:
+            # Суммируем суммы
+            try:
+                return str(int(old or 0) + int(re.sub(r"[^\d]", "", new)))
+            except:
+                return old
+        if not old:
+            return new
+        return old + ", " + new
+
+    def merge_time(old_tf, old_tt, new_work):
+        """Если в новом описании есть время — обновляем, иначе оставляем."""
+        tf, tt = parse_time(new_work)
+        if tf or tt:
+            return tf, tt
+        return old_tf, old_tt
+
+    new_addr  = merge(old_addr, extra.get("addresses",""))
+    new_work  = merge(old_work, extra.get("work_done",""))
+    new_col   = merge(old_col,  extra.get("collected",""), is_money=True)
+    new_share = merge(old_share,extra.get("my_share",""),  is_money=True)
+    new_tf, new_tt = merge_time(old_tf, old_tt, extra.get("work_done",""))
+
+    c = get_conn()
+    c.execute("""
+        UPDATE reports SET addresses=?, work_done=?, time_from=?, time_to=?, collected=?, my_share=?
+        WHERE user_id=? AND date=?
+    """, (new_addr, new_work, new_tf, new_tt, new_col, new_share, user_id, date))
+    c.commit()
+    c.close()
+    return True
+
 def get_reports(user_id):
-    """Возвращает записи с порядковым номером (1 = самая новая)."""
     c = get_conn()
     rows = c.execute(
         "SELECT date, addresses, work_done, time_from, time_to, collected, my_share "
@@ -80,8 +127,13 @@ def get_reports(user_id):
         (user_id,)
     ).fetchall()
     c.close()
-    # Добавляем порядковый номер
     return [(i+1,) + r for i, r in enumerate(rows)]
+
+def get_report_by_num(user_id, num):
+    rows = get_reports(user_id)
+    if not rows or num < 1 or num > len(rows):
+        return None
+    return rows[num-1]  # (num, date, addr, work, tf, tt, col, share)
 
 def get_report_by_date(user_id, date):
     c = get_conn()
@@ -96,7 +148,7 @@ def delete_by_num(user_id, num):
     rows = get_reports(user_id)
     if not rows or num < 1 or num > len(rows):
         return False
-    target_date = rows[num-1][1]  # индекс 1 = date (после номера)
+    target_date = rows[num-1][1]
     c = get_conn()
     c.execute("DELETE FROM reports WHERE user_id=? AND date=?", (user_id, target_date))
     c.commit()
@@ -176,15 +228,16 @@ def parse_time(text):
 # ── Клавиатуры ───────────────────────────────────────────────────────────────
 
 MAIN_KB = ReplyKeyboardMarkup(
-    [[KeyboardButton("➕ Новая запись"), KeyboardButton("📋 Мои записи")],
-     [KeyboardButton("📥 Скачать Excel"), KeyboardButton("⚙️ Напоминание")]],
+    [[KeyboardButton("➕ Новая запись"),     KeyboardButton("✏️ Дополнить запись")],
+     [KeyboardButton("📋 Мои записи"),       KeyboardButton("📥 Скачать Excel")],
+     [KeyboardButton("⚙️ Напоминание")]],
     resize_keyboard=True
 )
 
 def skip_kb(label):
     return ReplyKeyboardMarkup([[KeyboardButton(label)]], resize_keyboard=True)
 
-# ── Диалог: пошаговый ввод ───────────────────────────────────────────────────
+# ── Диалог: новая запись ─────────────────────────────────────────────────────
 
 async def new_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
@@ -201,7 +254,6 @@ async def new_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def step_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     date = parse_date(update.message.text)
     ctx.user_data["date"] = date
-
     existing = get_report_by_date(update.effective_user.id, date)
     if existing:
         ctx.user_data["overwrite"] = True
@@ -215,9 +267,8 @@ async def step_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     else:
         ctx.user_data["overwrite"] = False
-
     await update.message.reply_text(
-        "📍 *Шаг 2 из 5 — Адрес*\n\nВведите адрес (или несколько через запятую):",
+        "📍 *Шаг 2 из 5 — Адрес*\n\nВведите адрес:",
         parse_mode="Markdown",
         reply_markup=skip_kb("Пропустить")
     )
@@ -227,8 +278,7 @@ async def step_address(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     ctx.user_data["addresses"] = "" if text == "Пропустить" else text
     await update.message.reply_text(
-        "🔧 *Шаг 3 из 5 — Что сделано*\n\nОпишите выполненную работу.\n"
-        "_Можно указать время: «с 9 до 18»_",
+        "🔧 *Шаг 3 из 5 — Что сделано*\n\nОпишите работу:\n_Можно указать время: «с 9 до 18»_",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove()
     )
@@ -241,7 +291,7 @@ async def step_work(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["time_from"] = tf
     ctx.user_data["time_to"]   = tt
     await update.message.reply_text(
-        "💰 *Шаг 4 из 5 — Взято с клиента*\n\nВведите сумму в рублях:",
+        "💰 *Шаг 4 из 5 — Взято с клиента*\n\nВведите сумму:",
         parse_mode="Markdown",
         reply_markup=skip_kb("Не брал")
     )
@@ -260,28 +310,19 @@ async def step_collected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def step_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     ctx.user_data["my_share"] = "" if text == "Пропустить" else re.sub(r"[^\d]","",text)
-
-    d      = ctx.user_data
-    date   = d.get("date","")
-    addr   = d.get("addresses","") or "—"
-    work   = d.get("work_done","") or "—"
-    col    = d.get("collected","") or "—"
-    share  = d.get("my_share","")  or "—"
-    tf, tt = d.get("time_from",""), d.get("time_to","")
-
+    d = ctx.user_data
     lines = [
         "📋 *Проверьте запись:*\n",
-        f"📅 Дата: *{date}*",
-        f"📍 Адрес: {addr}",
-        f"🔧 Работа: {work}",
+        f"📅 Дата: *{d.get('date','')}*",
+        f"📍 Адрес: {d.get('addresses','') or '—'}",
+        f"🔧 Работа: {d.get('work_done','') or '—'}",
     ]
-    if tf or tt:
-        lines.append(f"🕐 Время: {tf or '?'} — {tt or '?'}")
-    lines += [f"💰 Взято: {col} ₽", f"🟢 Моя доля: {share} ₽"]
-
+    tf, tt = d.get("time_from",""), d.get("time_to","")
+    if tf or tt: lines.append(f"🕐 Время: {tf or '?'} — {tt or '?'}")
+    lines += [f"💰 Взято: {d.get('collected','') or '—'} ₽",
+              f"🟢 Моя доля: {d.get('my_share','') or '—'} ₽"]
     await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
+        "\n".join(lines), parse_mode="Markdown",
         reply_markup=ReplyKeyboardMarkup(
             [[KeyboardButton("✅ Сохранить"), KeyboardButton("❌ Отмена")]],
             resize_keyboard=True
@@ -299,6 +340,166 @@ async def step_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     return ConversationHandler.END
 
+# ── Диалог: дополнить запись ─────────────────────────────────────────────────
+
+async def edit_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid  = update.effective_user.id
+    rows = get_reports(uid)
+    if not rows:
+        await update.message.reply_text("📭 Записей нет — нечего дополнять.", reply_markup=MAIN_KB)
+        return ConversationHandler.END
+
+    ctx.user_data.clear()
+    ctx.user_data["mode"] = "append"
+
+    # Показываем список последних записей с кнопками
+    text = "✏️ *Выберите запись для дополнения:*\n\n"
+    buttons = []
+    for row in rows[:10]:  # максимум 10
+        num, date, addr, work, tf, tt, col, share = row
+        short = (work or addr or "—")[:30]
+        text += f"*#{num}* {date} — {short}\n"
+        buttons.append([KeyboardButton(f"#{num}")])
+    buttons.append([KeyboardButton("❌ Отмена")])
+
+    await update.message.reply_text(
+        text, parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+    )
+    return EDIT_NUM
+
+async def edit_num(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "❌ Отмена":
+        await update.message.reply_text("❌ Отменено.", reply_markup=MAIN_KB)
+        ctx.user_data.clear()
+        return ConversationHandler.END
+
+    m = re.search(r"(\d+)", text)
+    if not m:
+        await update.message.reply_text("Введите номер записи, например #1")
+        return EDIT_NUM
+
+    num = int(m.group(1))
+    row = get_report_by_num(update.effective_user.id, num)
+    if not row:
+        await update.message.reply_text(f"❌ Записи #{num} нет. Попробуйте ещё раз.")
+        return EDIT_NUM
+
+    _, date, addr, work, tf, tt, col, share = row
+    ctx.user_data["edit_date"] = date
+    ctx.user_data["edit_num"]  = num
+
+    await update.message.reply_text(
+        f"✏️ *Дополняем запись #{num} от {date}*\n\n"
+        f"📍 {addr or '—'}\n🔧 {work or '—'}\n"
+        f"💰 {col or '—'} ₽  🟢 {share or '—'} ₽\n\n"
+        f"Новые данные будут добавлены через запятую к существующим.\n"
+        f"Деньги — суммируются.",
+        parse_mode="Markdown"
+    )
+    await update.message.reply_text(
+        "📍 *Доп. адрес*\n\nДобавить адрес?",
+        parse_mode="Markdown",
+        reply_markup=skip_kb("Не менялось")
+    )
+    return EDIT_ADDR
+
+async def edit_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    ctx.user_data["addresses"] = "" if text == "Не менялось" else text
+    await update.message.reply_text(
+        "🔧 *Доп. работа*\n\nЧто ещё сделали?\n_Можно указать время: «с 14 до 18»_",
+        parse_mode="Markdown",
+        reply_markup=skip_kb("Не менялось")
+    )
+    return EDIT_WORK
+
+async def edit_work(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    ctx.user_data["work_done"] = "" if text == "Не менялось" else text
+    await update.message.reply_text(
+        "💰 *Доп. сумма*\n\nЕщё взяли с клиента? (будет прибавлена к существующей)",
+        parse_mode="Markdown",
+        reply_markup=skip_kb("Не менялось")
+    )
+    return EDIT_COLLECTED
+
+async def edit_collected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    ctx.user_data["collected"] = "" if text == "Не менялось" else re.sub(r"[^\d]","",text)
+    await update.message.reply_text(
+        "🟢 *Доп. доля*\n\nЕщё добавить к вашей доле?",
+        parse_mode="Markdown",
+        reply_markup=skip_kb("Не менялось")
+    )
+    return EDIT_SHARE
+
+async def edit_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    ctx.user_data["my_share"] = "" if text == "Не менялось" else re.sub(r"[^\d]","",text)
+
+    uid  = update.effective_user.id
+    date = ctx.user_data["edit_date"]
+    num  = ctx.user_data["edit_num"]
+
+    # Показываем что получится после слияния
+    old_row = get_report_by_date(uid, date)
+    if old_row:
+        _, old_addr, old_work, old_tf, old_tt, old_col, old_share = old_row
+
+        def preview_merge(old, new, is_money=False):
+            old = (old or "").strip()
+            new = (new or "").strip()
+            if not new or new == "Не менялось": return old or "—"
+            if is_money:
+                try: return str(int(old or 0) + int(re.sub(r"[^\d]","",new)))
+                except: return old or "—"
+            return (old + ", " + new) if old else new
+
+        p_addr  = preview_merge(old_addr,  ctx.user_data.get("addresses",""))
+        p_work  = preview_merge(old_work,  ctx.user_data.get("work_done",""))
+        p_col   = preview_merge(old_col,   ctx.user_data.get("collected",""), is_money=True)
+        p_share = preview_merge(old_share, ctx.user_data.get("my_share",""),  is_money=True)
+        tf, tt  = parse_time(ctx.user_data.get("work_done",""))
+        p_tf    = tf or old_tf or ""
+        p_tt    = tt or old_tt or ""
+
+        lines = [
+            f"📋 *Запись #{num} после дополнения:*\n",
+            f"📅 {date}",
+            f"📍 {p_addr}",
+            f"🔧 {p_work}",
+        ]
+        if p_tf or p_tt: lines.append(f"🕐 {p_tf or '?'} — {p_tt or '?'}")
+        lines += [f"💰 Взято: *{p_col} ₽*", f"🟢 Моя доля: *{p_share} ₽*"]
+
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup(
+                [[KeyboardButton("✅ Сохранить"), KeyboardButton("❌ Отмена")]],
+                resize_keyboard=True
+            )
+        )
+    return EDIT_CONFIRM
+
+async def edit_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.strip() == "✅ Сохранить":
+        uid  = update.effective_user.id
+        date = ctx.user_data["edit_date"]
+        num  = ctx.user_data["edit_num"]
+        ok   = append_to_report(uid, date, ctx.user_data)
+        if ok:
+            await update.message.reply_text(f"✅ Запись #{num} дополнена!", reply_markup=MAIN_KB)
+        else:
+            await update.message.reply_text("❌ Ошибка при сохранении.", reply_markup=MAIN_KB)
+    else:
+        await update.message.reply_text("❌ Отменено.", reply_markup=MAIN_KB)
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+# ── cancel ────────────────────────────────────────────────────────────────────
+
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     await update.message.reply_text("❌ Отменено.", reply_markup=MAIN_KB)
@@ -310,9 +511,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     set_reminder(update.effective_user.id, True)
     await update.message.reply_text(
         "👋 *Привет! Я ваш рабочий журнал.*\n\n"
-        "Нажмите *➕ Новая запись* — я спрошу всё по порядку.\n\n"
+        "Нажмите *➕ Новая запись* — заполним по шагам.\n"
+        "Нажмите *✏️ Дополнить запись* — добавим к уже существующей.\n\n"
         "*/delete 1* — удалить запись №1\n"
-        "*/reminder on* или */reminder off* — напоминание",
+        "*/reminder on|off* — напоминание",
         parse_mode="Markdown",
         reply_markup=MAIN_KB
     )
@@ -338,7 +540,7 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     if not args or not args[0].isdigit():
         await update.message.reply_text(
-            "Укажите номер: /delete 1\nНомера видны в списке записей (значок #).",
+            "Укажите номер: /delete 1\nНомера видны в /list (значок #).",
             reply_markup=MAIN_KB
         )
         return
@@ -380,8 +582,10 @@ async def cmd_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if text == "📋 Мои записи":    await cmd_list(update, ctx)
-    elif text == "📥 Скачать Excel": await cmd_excel(update, ctx)
+    if text == "📋 Мои записи":
+        await cmd_list(update, ctx)
+    elif text == "📥 Скачать Excel":
+        await cmd_excel(update, ctx)
     elif text == "⚙️ Напоминание":
         ctx.args = []
         await cmd_reminder(update, ctx)
@@ -405,7 +609,8 @@ def main():
     init_db()
     app = ApplicationBuilder().token(TOKEN).build()
 
-    conv = ConversationHandler(
+    # Диалог: новая запись
+    conv_new = ConversationHandler(
         entry_points=[
             CommandHandler("new", new_entry),
             MessageHandler(filters.Regex("^➕ Новая запись$"), new_entry),
@@ -421,7 +626,25 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    app.add_handler(conv)
+    # Диалог: дополнить запись
+    conv_edit = ConversationHandler(
+        entry_points=[
+            CommandHandler("edit", edit_entry),
+            MessageHandler(filters.Regex("^✏️ Дополнить запись$"), edit_entry),
+        ],
+        states={
+            EDIT_NUM:       [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_num)],
+            EDIT_ADDR:      [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_addr)],
+            EDIT_WORK:      [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_work)],
+            EDIT_COLLECTED: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_collected)],
+            EDIT_SHARE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_share)],
+            EDIT_CONFIRM:   [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(conv_new)
+    app.add_handler(conv_edit)
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("list",     cmd_list))
     app.add_handler(CommandHandler("delete",   cmd_delete))
